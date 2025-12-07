@@ -6,6 +6,9 @@ ComfyUI 模型下载脚本 - 多镜像加速版
     # 下载单个文件
     python download_models.py <url> [保存路径]
 
+    # 断点续传上次未完成的下载
+    python download_models.py -r
+
     # 示例
     python download_models.py https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/text_encoders/qwen_3_4b.safetensors
     python download_models.py https://huggingface.co/xxx/model.safetensors Z:/models/checkpoints/model.safetensors
@@ -125,6 +128,25 @@ def delete_progress(url: str, save_path: Path):
     progress_file = get_progress_file(url, save_path)
     if progress_file.exists():
         progress_file.unlink()
+
+
+def list_pending_downloads() -> list[DownloadProgress]:
+    """列出所有未完成的下载"""
+    pending = []
+    if not PROGRESS_DIR.exists():
+        return pending
+
+    for progress_file in PROGRESS_DIR.glob("*.progress"):
+        try:
+            content = progress_file.read_text(encoding='utf-8')
+            progress = DownloadProgress.from_json(content)
+            pending.append(progress)
+        except Exception:
+            continue
+
+    # 按时间戳排序，最近的在前
+    pending.sort(key=lambda x: x.timestamp, reverse=True)
+    return pending
 
 
 def get_filename_from_url(url: str) -> str:
@@ -554,18 +576,60 @@ def main():
   %(prog)s -t 8 https://huggingface.co/xxx/model.safetensors
 
 断点续传:
-  下载中断后，再次运行相同命令会自动从断点继续下载。
+  %(prog)s -r              # 续传最近一次未完成的下载
+  %(prog)s -r --list       # 列出所有未完成的下载
   进度信息保存在 ~/.comfy_download/ 目录。
         '''
     )
-    parser.add_argument('url', help='HuggingFace 模型下载 URL')
+    parser.add_argument('url', nargs='?', help='HuggingFace 模型下载 URL')
     parser.add_argument('save_path', nargs='?', help='保存路径（可选，默认根据 URL 自动推断）')
+    parser.add_argument('-r', '--resume', action='store_true',
+                        help='续传上次未完成的下载')
+    parser.add_argument('--list', action='store_true',
+                        help='列出所有未完成的下载（配合 -r 使用）')
     parser.add_argument('-t', '--threads', type=int, default=4,
                         help='并行下载线程数（默认 4）')
     parser.add_argument('-o', '--output-dir', type=str, default="Z:/models",
                         help='模型保存根目录（默认 Z:/models）')
 
     args = parser.parse_args()
+
+    # 处理 -r 参数：续传模式
+    if args.resume or args.list:
+        pending = list_pending_downloads()
+
+        if not pending:
+            print("没有未完成的下载任务。")
+            sys.exit(0)
+
+        if args.list:
+            # 列出所有未完成的下载
+            print("=" * 60)
+            print("未完成的下载任务:")
+            print("=" * 60)
+            for i, p in enumerate(pending, 1):
+                percent = p.downloaded_size * 100 / p.file_size if p.file_size > 0 else 0
+                time_str = time.strftime('%Y-%m-%d %H:%M', time.localtime(p.timestamp))
+                print(f"\n[{i}] {Path(p.save_path).name}")
+                print(f"    进度: {p.downloaded_size / 1024 / 1024:.1f} MB / {p.file_size / 1024 / 1024:.1f} MB ({percent:.1f}%)")
+                print(f"    路径: {p.save_path}")
+                print(f"    时间: {time_str}")
+            print("\n" + "=" * 60)
+            print("使用 -r 续传最近的任务，或运行原始命令续传指定任务")
+            sys.exit(0)
+
+        # 续传最近的一个任务
+        latest = pending[0]
+        args.url = latest.url
+        args.save_path = latest.save_path
+        percent = latest.downloaded_size * 100 / latest.file_size if latest.file_size > 0 else 0
+        print(f"续传任务: {Path(latest.save_path).name}")
+        print(f"进度: {latest.downloaded_size / 1024 / 1024:.1f} MB / {latest.file_size / 1024 / 1024:.1f} MB ({percent:.1f}%)")
+
+    # 检查是否提供了 URL
+    if not args.url:
+        parser.print_help()
+        sys.exit(1)
 
     # 更新配置
     num_threads = args.threads
