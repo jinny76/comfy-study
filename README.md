@@ -40,6 +40,7 @@ This repository contains my study notes while learning the ComfyUI codebase. Eac
 | [工作流入门](docs/02-工作流入门.md) | Node system basics, workflows, tips |
 | [模型指南](docs/03-模型指南.md) | Model downloads, types, LoRA, ControlNet |
 | [性能优化](docs/04-性能优化.md) | VRAM management, speed optimization |
+| [自定义节点](docs/05-自定义节点.md) | Custom nodes installation, recommendations |
 
 ## Tools
 
