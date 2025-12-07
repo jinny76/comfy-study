@@ -30,6 +30,17 @@ This repository contains my study notes while learning the ComfyUI codebase. Eac
 | 12 | [Conditioning](study/12-条件系统-conds.py.md) | `conds.py` | Condition wrappers, batching, area masks |
 | 13 | [Operations](study/13-操作封装-ops.py.md) | `ops.py` | Weight casting, FP8 ops, LoRA injection |
 
+## User Guides
+
+📚 **[docs/](docs/)** - User-friendly guides for ComfyUI beginners
+
+| Guide | Description |
+|-------|-------------|
+| [安装配置](docs/01-安装配置.md) | Installation, environment setup, proxy configuration |
+| [工作流入门](docs/02-工作流入门.md) | Node system basics, workflows, tips |
+| [模型指南](docs/03-模型指南.md) | Model downloads, types, LoRA, ControlNet |
+| [性能优化](docs/04-性能优化.md) | VRAM management, speed optimization |
+
 ## Tools
 
 - [`tools/download_models.py`](tools/download_models.py) - Multi-mirror accelerated model downloader
