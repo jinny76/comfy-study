@@ -43,14 +43,30 @@ This repository contains my study notes while learning the ComfyUI codebase. Eac
 | [性能优化](docs/04-性能优化.md) | VRAM management, speed optimization |
 | [自定义节点](docs/05-自定义节点.md) | Custom nodes installation, recommendations |
 
+## Workflow Documentation
+
+📋 **[workflow-docs/](workflow-docs/)** - Detailed workflow explanations
+
+| Workflow | Description |
+|----------|-------------|
+| [Z-Image-Turbo](workflow-docs/z-image-turbo.md) | Text-to-image, node-by-node parameter guide |
+| [Hunyuan3D v2.1](workflow-docs/hunyuan3d-v2.1.md) | Image-to-3D model generation |
+
 ## Tools
 
 - [`tools/download_models.py`](tools/download_models.py) - Multi-mirror accelerated model downloader
+  - FlashGet-style multi-threaded download (8 threads, 4MB blocks)
   - Multi-mirror parallel download (hf-mirror.com, aifasthub.com)
+  - **SHA256 hash verification** (`--verify` or `--sha256`)
+  - **Direct download mode** (`--no-mirror` for huggingface.co only)
   - **Robust resume support** - progress saved to `~/.comfy_download/`
   - Ctrl+C safe - gracefully saves progress on interrupt
-  - File size verification across mirrors
-  - Auto speed test to select fastest mirror
+
+- [`tools/verify_models.py`](tools/verify_models.py) - Model file integrity checker
+  - Verify safetensors/ckpt file structure
+  - Check tensor data readability
+  - Compare against known model sizes
+  - Batch scan entire model directories
 
 ## Architecture Overview
 
