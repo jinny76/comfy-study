@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ComfyUI 模型下载脚本 - 多镜像加速版
+ComfyUI 模型下载脚本 - FlashGet 多线程模式
 
 使用方法:
     # 下载单个文件
@@ -9,15 +9,18 @@ ComfyUI 模型下载脚本 - 多镜像加速版
     # 断点续传上次未完成的下载
     python download_models.py -r
 
+    # 使用更多线程 (默认8线程)
+    python download_models.py -t 16 <url>
+
     # 示例
-    python download_models.py https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/text_encoders/qwen_3_4b.safetensors
-    python download_models.py https://huggingface.co/xxx/model.safetensors Z:/models/checkpoints/model.safetensors
+    python download_models.py https://huggingface.co/xxx/model.safetensors
 
 功能:
-    1. 多镜像并行分片下载（加速）
-    2. 自动测速选择最快镜像
-    3. 支持断点续传（进度保存到 .progress 文件）
-    4. 检查文件大小，已存在且大小正确则跳过
+    1. FlashGet 风格多线程分块下载（同一镜像也多线程）
+    2. 动态任务分配（快的线程多下载）
+    3. 自动测速选择最快镜像
+    4. 断点续传（进度保存到 ~/.comfy_download/）
+    5. 慢速自动切换镜像
 """
 
 import os
@@ -33,11 +36,13 @@ from pathlib import Path
 from urllib.parse import urlparse, unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Optional
+from queue import Queue, Empty
 
 # 全局中断标志
 interrupted = False
+
 
 def signal_handler(signum, frame):
     """处理 Ctrl+C 信号"""
@@ -57,21 +62,43 @@ MODELS_DIR = Path("Z:/models")
 # 进度文件目录
 PROGRESS_DIR = Path("~/.comfy_download").expanduser()
 
-# 多镜像源（会自动测速选择最快的）
-# 参考: https://hf-mirror.com/, https://aifasthub.com/
+# 多镜像源
 MIRRORS = [
-    "hf-mirror.com",       # 国内镜像（推荐）
+    "hf-mirror.com",       # 国内镜像
     "aifasthub.com",       # AI快站镜像
-    "huggingface.co",      # 原始源（需要梯子）
+    "huggingface.co",      # 原始源
 ]
 
 # 下载配置
-TIMEOUT = (10, 30)  # (连接超时, 读取超时) - 缩短读取超时
-CHUNK_SIZE = 1024 * 1024  # 1MB
-NUM_THREADS = 4  # 每个文件的并行下载线程数
-MAX_RETRIES = 10  # 增加重试次数，因为会更频繁地重连
-MIN_SPEED = 50 * 1024  # 最低速度 50KB/s，低于此值重连
-SPEED_CHECK_INTERVAL = 5  # 每5秒检查一次速度
+TIMEOUT = (10, 30)
+CHUNK_SIZE = 64 * 1024       # 64KB 读取块
+BLOCK_SIZE = 4 * 1024 * 1024  # 4MB 每个下载块 (FlashGet 风格小块)
+NUM_THREADS = 8              # 默认8线程 (FlashGet 风格)
+MAX_RETRIES = 5
+MIN_SPEED = 100 * 1024       # 最低速度 100KB/s
+SPEED_CHECK_INTERVAL = 3     # 每3秒检查速度
+
+
+@dataclass
+class BlockInfo:
+    """下载块信息"""
+    index: int
+    start: int
+    end: int
+    downloaded: int = 0
+    status: str = 'pending'  # pending, downloading, completed, failed
+
+    @property
+    def size(self) -> int:
+        return self.end - self.start + 1
+
+    @property
+    def remaining(self) -> int:
+        return self.size - self.downloaded
+
+    @property
+    def is_complete(self) -> bool:
+        return self.downloaded >= self.size
 
 
 @dataclass
@@ -81,9 +108,10 @@ class DownloadProgress:
     save_path: str
     file_size: int
     downloaded_size: int
-    chunk_states: dict  # {chunk_index: downloaded_bytes}
+    blocks: list  # List of BlockInfo as dicts
     mirrors: list
     timestamp: float
+    block_size: int = BLOCK_SIZE
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, indent=2)
@@ -97,7 +125,6 @@ class DownloadProgress:
 def get_progress_file(url: str, save_path: Path) -> Path:
     """获取进度文件路径"""
     PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
-    # 使用 URL 和保存路径的哈希作为文件名
     key = f"{url}:{save_path}"
     hash_name = hashlib.md5(key.encode()).hexdigest()[:16]
     return PROGRESS_DIR / f"{hash_name}.progress"
@@ -110,7 +137,6 @@ def load_progress(url: str, save_path: Path) -> Optional[DownloadProgress]:
         try:
             content = progress_file.read_text(encoding='utf-8')
             progress = DownloadProgress.from_json(content)
-            # 验证 URL 和保存路径匹配
             if progress.url == url and progress.save_path == str(save_path):
                 return progress
         except Exception as e:
@@ -146,7 +172,6 @@ def list_pending_downloads() -> list[DownloadProgress]:
         except Exception:
             continue
 
-    # 按时间戳排序，最近的在前
     pending.sort(key=lambda x: x.timestamp, reverse=True)
     return pending
 
@@ -164,9 +189,8 @@ def get_save_path_from_url(url: str, models_dir: Path = None) -> Path:
         models_dir = MODELS_DIR
 
     filename = get_filename_from_url(url)
-
-    # 根据 URL 路径推断目录
     url_lower = url.lower()
+
     if 'text_encoder' in url_lower or 'clip' in url_lower:
         subdir = 'text_encoders'
     elif 'diffusion_model' in url_lower or 'unet' in url_lower:
@@ -180,27 +204,26 @@ def get_save_path_from_url(url: str, models_dir: Path = None) -> Path:
     elif 'checkpoint' in url_lower or 'ckpt' in url_lower:
         subdir = 'checkpoints'
     else:
-        # 默认放 checkpoints
         subdir = 'checkpoints'
 
     return models_dir / subdir / filename
 
 
 def test_mirror_speed(url: str, mirror: str) -> tuple[str, float]:
-    """测试镜像速度，返回 (镜像, 速度MB/s)"""
+    """测试镜像速度"""
     test_url = url.replace("huggingface.co", mirror)
     try:
         start = time.time()
         response = requests.get(
             test_url,
-            headers={'Range': 'bytes=0-1048575'},  # 下载1MB测速
+            headers={'Range': 'bytes=0-1048575'},
             timeout=TIMEOUT,
             stream=True
         )
         if response.status_code in (200, 206):
             data = response.content
             elapsed = time.time() - start
-            speed = len(data) / elapsed / 1024 / 1024  # MB/s
+            speed = len(data) / elapsed / 1024 / 1024
             return (mirror, speed)
     except:
         pass
@@ -220,7 +243,6 @@ def select_best_mirrors(url: str, count: int = 2) -> list[str]:
                 results.append((mirror, speed))
                 print(f"    {mirror}: {speed:.2f} MB/s")
 
-    # 按速度排序
     results.sort(key=lambda x: x[1], reverse=True)
     best = [r[0] for r in results[:count]]
 
@@ -233,7 +255,7 @@ def select_best_mirrors(url: str, count: int = 2) -> list[str]:
 
 
 def get_file_info(url: str, mirrors: list[str]) -> tuple[int, bool]:
-    """获取文件大小和是否支持分片下载，从多个镜像验证尺寸一致性"""
+    """获取文件大小和是否支持分片下载"""
     sizes = []
     accept_ranges = False
 
@@ -253,16 +275,13 @@ def get_file_info(url: str, mirrors: list[str]) -> tuple[int, bool]:
     if not sizes:
         return (0, False)
 
-    # 验证所有镜像返回相同的文件大小
     first_size = sizes[0][1]
     for mirror, size in sizes[1:]:
         if size != first_size:
             print(f"  [警告] 镜像文件大小不一致: {sizes[0][0]}={first_size}, {mirror}={size}")
-            # 使用原始源的大小（如果有）
             for m, s in sizes:
                 if 'huggingface.co' in m:
                     return (s, accept_ranges)
-            # 否则使用第一个
             return (first_size, accept_ranges)
 
     return (first_size, accept_ranges)
@@ -276,238 +295,296 @@ def check_file_complete(save_path: Path, expected_size: int) -> bool:
 
 
 class SlowSpeedError(Exception):
-    """速度过慢异常，用于触发重连"""
+    """速度过慢异常"""
     pass
 
 
-def download_chunk(url: str, start: int, end: int, mirrors: list[str],
-                   chunk_index: int, temp_dir: Path, progress: DownloadProgress,
-                   pbar: tqdm, lock: threading.Lock) -> bool:
-    """下载单个分片到临时文件，带速度监测和自动重连"""
-    global interrupted
-    chunk_file = temp_dir / f"chunk_{chunk_index:04d}"
+class BlockDownloader:
+    """FlashGet 风格的块下载管理器"""
 
-    # 检查已下载的部分
-    chunk_downloaded = progress.chunk_states.get(str(chunk_index), 0)
-    chunk_size = end - start + 1
+    def __init__(self, url: str, save_path: Path, file_size: int,
+                 mirrors: list[str], num_threads: int,
+                 existing_progress: Optional[DownloadProgress] = None):
+        self.url = url
+        self.save_path = save_path
+        self.file_size = file_size
+        self.mirrors = mirrors
+        self.num_threads = num_threads
 
-    if chunk_downloaded >= chunk_size:
-        # 分片已完成
-        return True
+        # 创建临时目录
+        self.temp_dir = save_path.parent / f".{save_path.name}.parts"
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
 
-    mirror_index = chunk_index % len(mirrors)  # 初始镜像，每个线程用不同的
+        # 初始化块列表
+        self.blocks: list[BlockInfo] = []
+        self.block_queue = Queue()
+        self.lock = threading.Lock()
+        self.downloaded_bytes = 0
+        self.active_downloads = 0
 
-    for retry in range(MAX_RETRIES):
-        if interrupted:
-            return False
+        # 统计信息
+        self.thread_stats = {}  # thread_id -> {'bytes': 0, 'blocks': 0}
 
-        # 选择镜像：每次重试切换到下一个镜像
-        mirror = mirrors[(mirror_index + retry) % len(mirrors)]
-        download_url = url.replace("huggingface.co", mirror)
+        # 初始化或恢复块
+        self._init_blocks(existing_progress)
 
-        # 更新 Range header
-        current_start = start + chunk_downloaded
-        headers = {
-            'User-Agent': 'Mozilla/5.0',
-            'Range': f'bytes={current_start}-{end}'
-        }
+    def _init_blocks(self, existing_progress: Optional[DownloadProgress]):
+        """初始化下载块"""
+        # 计算块数量
+        num_blocks = (self.file_size + BLOCK_SIZE - 1) // BLOCK_SIZE
 
-        try:
-            response = requests.get(
-                download_url,
-                headers=headers,
-                timeout=TIMEOUT,
-                stream=True
-            )
+        if existing_progress and existing_progress.file_size == self.file_size:
+            # 从进度恢复
+            for block_data in existing_progress.blocks:
+                block = BlockInfo(**block_data)
+                # 验证临时文件实际大小
+                block_file = self.temp_dir / f"block_{block.index:06d}"
+                if block_file.exists():
+                    actual_size = block_file.stat().st_size
+                    block.downloaded = min(actual_size, block.size)
+                    if block.is_complete:
+                        block.status = 'completed'
+                    else:
+                        block.status = 'pending'
+                else:
+                    block.downloaded = 0
+                    block.status = 'pending'
+                self.blocks.append(block)
+                self.downloaded_bytes += block.downloaded
+        else:
+            # 新建块
+            for i in range(num_blocks):
+                start = i * BLOCK_SIZE
+                end = min((i + 1) * BLOCK_SIZE - 1, self.file_size - 1)
+                block = BlockInfo(index=i, start=start, end=end)
+                self.blocks.append(block)
 
-            if response.status_code not in (200, 206):
-                continue
+        # 将未完成的块加入队列
+        pending_blocks = [b for b in self.blocks if not b.is_complete]
+        for block in pending_blocks:
+            self.block_queue.put(block)
 
-            mode = 'ab' if chunk_downloaded > 0 else 'wb'
+        if self.downloaded_bytes > 0:
+            pct = self.downloaded_bytes * 100 / self.file_size
+            print(f"  [续传] 已下载 {self.downloaded_bytes / 1024 / 1024:.1f} MB / "
+                  f"{self.file_size / 1024 / 1024:.1f} MB ({pct:.1f}%)")
+            print(f"  [续传] {len(pending_blocks)} / {len(self.blocks)} 块待下载")
 
-            # 速度监测变量
-            speed_check_start = time.time()
-            speed_check_bytes = 0
-
-            with open(chunk_file, mode) as f:
-                for data in response.iter_content(chunk_size=CHUNK_SIZE):
-                    if interrupted:
-                        # 保存当前进度
-                        with lock:
-                            progress.chunk_states[str(chunk_index)] = chunk_downloaded
-                            progress.downloaded_size = sum(progress.chunk_states.values())
-                            save_progress(progress)
-                        return False
-
-                    if data:
-                        f.write(data)
-                        data_len = len(data)
-                        chunk_downloaded += data_len
-                        speed_check_bytes += data_len
-
-                        with lock:
-                            pbar.update(data_len)
-                            progress.chunk_states[str(chunk_index)] = chunk_downloaded
-                            progress.downloaded_size = sum(progress.chunk_states.values())
-
-                        # 每隔一段时间检查速度
-                        elapsed = time.time() - speed_check_start
-                        if elapsed >= SPEED_CHECK_INTERVAL:
-                            speed = speed_check_bytes / elapsed
-                            if speed < MIN_SPEED:
-                                # 速度太慢，抛异常触发重连
-                                raise SlowSpeedError(
-                                    f"速度过慢: {speed/1024:.1f} KB/s < {MIN_SPEED/1024:.0f} KB/s, 切换镜像"
-                                )
-                            # 重置计数器
-                            speed_check_start = time.time()
-                            speed_check_bytes = 0
-
-            # 下载完成，保存进度
-            with lock:
-                save_progress(progress)
-
-            return True
-
-        except SlowSpeedError as e:
-            # 速度过慢，切换镜像重试
-            with lock:
-                # 不用打印太多，进度条已经能看出来卡住了
-                pass
-            continue
-
-        except Exception as e:
-            # 其他错误，短暂等待后重试
-            if retry < MAX_RETRIES - 1:
-                time.sleep(0.5)
-            continue
-
-    return False
-
-
-def download_file_multithread(url: str, save_path: Path, mirrors: list[str],
-                               file_size: int, num_threads: int = NUM_THREADS,
-                               existing_progress: Optional[DownloadProgress] = None) -> bool:
-    """多线程分片下载，支持断点续传"""
-    global interrupted
-
-    # 确保目录存在
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # 创建临时目录
-    temp_dir = save_path.parent / f".{save_path.name}.parts"
-    temp_dir.mkdir(parents=True, exist_ok=True)
-
-    # 计算分片
-    part_size = file_size // num_threads
-    chunks = []
-    for i in range(num_threads):
-        start = i * part_size
-        end = file_size - 1 if i == num_threads - 1 else (i + 1) * part_size - 1
-        chunks.append((i, start, end))
-
-    # 初始化或恢复进度
-    if existing_progress and existing_progress.file_size == file_size:
-        progress = existing_progress
-        # 从临时文件实际大小重新计算已下载量（更可靠）
-        actual_downloaded = 0
-        for i in range(num_threads):
-            chunk_file = temp_dir / f"chunk_{i:04d}"
-            if chunk_file.exists():
-                chunk_size = chunk_file.stat().st_size
-                progress.chunk_states[str(i)] = chunk_size
-                actual_downloaded += chunk_size
-        progress.downloaded_size = actual_downloaded
-        initial_downloaded = actual_downloaded
-        if initial_downloaded > 0:
-            print(f"  [续传] 已下载 {initial_downloaded / 1024 / 1024:.1f} MB / {file_size / 1024 / 1024:.1f} MB ({initial_downloaded * 100 / file_size:.1f}%)")
-    else:
-        progress = DownloadProgress(
-            url=url,
-            save_path=str(save_path),
-            file_size=file_size,
-            downloaded_size=0,
-            chunk_states={},
-            mirrors=mirrors,
+    def _get_progress(self) -> DownloadProgress:
+        """获取当前进度"""
+        return DownloadProgress(
+            url=self.url,
+            save_path=str(self.save_path),
+            file_size=self.file_size,
+            downloaded_size=self.downloaded_bytes,
+            blocks=[asdict(b) for b in self.blocks],
+            mirrors=self.mirrors,
             timestamp=time.time()
         )
-        initial_downloaded = 0
 
-    lock = threading.Lock()
+    def _download_block(self, thread_id: int, pbar: tqdm) -> bool:
+        """工作线程：从队列获取块并下载"""
+        global interrupted
 
-    # 显示线程和镜像分配
-    print(f"  [下载] {num_threads} 线程并行下载 (速度 < {MIN_SPEED//1024}KB/s 自动切换镜像)")
-    for i in range(min(num_threads, len(mirrors))):
-        print(f"    线程 {i}: {mirrors[i % len(mirrors)]}")
+        # 初始化线程统计
+        with self.lock:
+            self.thread_stats[thread_id] = {'bytes': 0, 'blocks': 0}
 
-    with tqdm(total=file_size, initial=initial_downloaded, unit='B', unit_scale=True,
-              desc=save_path.name[:30], ncols=80) as pbar:
+        mirror_index = thread_id % len(self.mirrors)
 
-        with ThreadPoolExecutor(max_workers=num_threads) as executor:
-            futures = []
-            for chunk_index, start, end in chunks:
-                future = executor.submit(
-                    download_chunk, url, start, end,
-                    mirrors, chunk_index, temp_dir, progress, pbar, lock
-                )
-                futures.append(future)
+        while not interrupted:
+            # 从队列获取块
+            try:
+                block = self.block_queue.get(timeout=0.5)
+            except Empty:
+                # 队列空了，检查是否还有下载中的
+                with self.lock:
+                    if self.active_downloads == 0:
+                        return True
+                continue
 
-            # 等待所有完成
-            results = [f.result() for f in futures]
-            success = all(results)
+            if block.is_complete:
+                self.block_queue.task_done()
+                continue
 
-    if success and not interrupted:
-        # 验证所有分片文件
-        all_chunks_exist = True
-        for i in range(num_threads):
-            chunk_file = temp_dir / f"chunk_{i:04d}"
-            if not chunk_file.exists():
-                all_chunks_exist = False
-                print(f"  [错误] 分片 {i} 不存在")
-                break
+            with self.lock:
+                block.status = 'downloading'
+                self.active_downloads += 1
 
-        if all_chunks_exist:
-            # 合并分片
-            print("  [合并] 合并分片文件...")
-            with open(save_path, 'wb') as outfile:
-                for i in range(num_threads):
-                    chunk_file = temp_dir / f"chunk_{i:04d}"
-                    with open(chunk_file, 'rb') as infile:
-                        outfile.write(infile.read())
-                    chunk_file.unlink()
+            success = False
+            for retry in range(MAX_RETRIES):
+                if interrupted:
+                    break
 
-            # 验证最终文件大小
-            final_size = save_path.stat().st_size
-            if final_size == file_size:
-                # 清理
+                mirror = self.mirrors[(mirror_index + retry) % len(self.mirrors)]
+                download_url = self.url.replace("huggingface.co", mirror)
+
+                current_start = block.start + block.downloaded
+                headers = {
+                    'User-Agent': 'Mozilla/5.0',
+                    'Range': f'bytes={current_start}-{block.end}'
+                }
+
                 try:
-                    temp_dir.rmdir()
-                except:
-                    pass
-                delete_progress(url, save_path)
-                print(f"  [完成] {save_path.name}")
-                return True
-            else:
-                print(f"  [错误] 文件大小不匹配: {final_size} != {file_size}")
-                save_path.unlink()
-                return False
-        else:
-            save_progress(progress)
-            return False
-    else:
-        # 保存进度以便下次续传
-        save_progress(progress)
-        print(f"  [中断] 进度已保存到 ~/.comfy_download/，下次运行将自动续传")
+                    response = requests.get(
+                        download_url, headers=headers,
+                        timeout=TIMEOUT, stream=True
+                    )
+
+                    if response.status_code not in (200, 206):
+                        continue
+
+                    block_file = self.temp_dir / f"block_{block.index:06d}"
+                    mode = 'ab' if block.downloaded > 0 else 'wb'
+
+                    speed_check_start = time.time()
+                    speed_check_bytes = 0
+
+                    with open(block_file, mode) as f:
+                        for data in response.iter_content(chunk_size=CHUNK_SIZE):
+                            if interrupted:
+                                break
+
+                            if data:
+                                f.write(data)
+                                data_len = len(data)
+                                block.downloaded += data_len
+                                speed_check_bytes += data_len
+
+                                with self.lock:
+                                    self.downloaded_bytes += data_len
+                                    self.thread_stats[thread_id]['bytes'] += data_len
+                                    pbar.update(data_len)
+
+                                # 速度检查
+                                elapsed = time.time() - speed_check_start
+                                if elapsed >= SPEED_CHECK_INTERVAL:
+                                    speed = speed_check_bytes / elapsed
+                                    if speed < MIN_SPEED:
+                                        raise SlowSpeedError(f"速度过慢: {speed/1024:.0f} KB/s")
+                                    speed_check_start = time.time()
+                                    speed_check_bytes = 0
+
+                    if block.is_complete:
+                        success = True
+                        with self.lock:
+                            block.status = 'completed'
+                            self.thread_stats[thread_id]['blocks'] += 1
+                        break
+
+                except SlowSpeedError:
+                    # 切换镜像重试
+                    continue
+                except Exception as e:
+                    if retry < MAX_RETRIES - 1:
+                        time.sleep(0.5)
+                    continue
+
+            with self.lock:
+                self.active_downloads -= 1
+                if not success and not interrupted:
+                    block.status = 'pending'
+                    # 重新放回队列
+                    self.block_queue.put(block)
+
+            self.block_queue.task_done()
+
         return False
 
+    def download(self) -> bool:
+        """执行下载"""
+        global interrupted
 
-def download_file_simple(url: str, save_path: Path, mirrors: list[str],
-                          existing_progress: Optional[DownloadProgress] = None) -> bool:
-    """简单单线程下载（用于小文件或不支持分片的情况）"""
+        num_blocks = len(self.blocks)
+        pending = sum(1 for b in self.blocks if not b.is_complete)
+
+        print(f"  [下载] FlashGet 模式: {self.num_threads} 线程, {num_blocks} 块 (每块 {BLOCK_SIZE // 1024 // 1024}MB)")
+        print(f"  [下载] 速度 < {MIN_SPEED // 1024}KB/s 自动切换镜像")
+
+        with tqdm(total=self.file_size, initial=self.downloaded_bytes,
+                  unit='B', unit_scale=True, desc=self.save_path.name[:30],
+                  ncols=80) as pbar:
+
+            with ThreadPoolExecutor(max_workers=self.num_threads) as executor:
+                futures = []
+                for i in range(self.num_threads):
+                    future = executor.submit(self._download_block, i, pbar)
+                    futures.append(future)
+
+                # 定期保存进度
+                while not all(f.done() for f in futures):
+                    time.sleep(2)
+                    with self.lock:
+                        save_progress(self._get_progress())
+
+                results = [f.result() for f in futures]
+
+        # 保存最终进度
+        save_progress(self._get_progress())
+
+        if interrupted:
+            print(f"  [中断] 进度已保存，下次运行 -r 续传")
+            self._print_stats()
+            return False
+
+        # 检查是否全部完成
+        incomplete = [b for b in self.blocks if not b.is_complete]
+        if incomplete:
+            print(f"  [错误] {len(incomplete)} 块未完成")
+            return False
+
+        # 合并文件
+        return self._merge_blocks()
+
+    def _merge_blocks(self) -> bool:
+        """合并所有块到最终文件"""
+        print("  [合并] 合并分块文件...")
+
+        try:
+            with open(self.save_path, 'wb') as outfile:
+                for block in sorted(self.blocks, key=lambda b: b.index):
+                    block_file = self.temp_dir / f"block_{block.index:06d}"
+                    with open(block_file, 'rb') as infile:
+                        outfile.write(infile.read())
+                    block_file.unlink()
+
+            # 验证文件大小
+            final_size = self.save_path.stat().st_size
+            if final_size != self.file_size:
+                print(f"  [错误] 文件大小不匹配: {final_size} != {self.file_size}")
+                self.save_path.unlink()
+                return False
+
+            # 清理
+            try:
+                self.temp_dir.rmdir()
+            except:
+                pass
+
+            delete_progress(self.url, self.save_path)
+            print(f"  [完成] {self.save_path.name}")
+            self._print_stats()
+            return True
+
+        except Exception as e:
+            print(f"  [错误] 合并失败: {e}")
+            return False
+
+    def _print_stats(self):
+        """打印线程统计"""
+        print("\n  [统计] 各线程下载量:")
+        total_bytes = 0
+        for tid, stats in sorted(self.thread_stats.items()):
+            mb = stats['bytes'] / 1024 / 1024
+            total_bytes += stats['bytes']
+            print(f"    线程 {tid}: {mb:.1f} MB ({stats['blocks']} 块)")
+
+
+def download_file_simple(url: str, save_path: Path, mirrors: list[str]) -> bool:
+    """简单单线程下载（用于小文件）"""
     save_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = save_path.with_suffix(save_path.suffix + '.downloading')
 
-    # 断点续传
     downloaded_size = 0
     if temp_path.exists():
         downloaded_size = temp_path.stat().st_size
@@ -523,12 +600,8 @@ def download_file_simple(url: str, save_path: Path, mirrors: list[str],
 
         try:
             print(f"  [连接] {mirror}")
-            response = requests.get(
-                download_url,
-                headers=headers,
-                stream=True,
-                timeout=TIMEOUT
-            )
+            response = requests.get(download_url, headers=headers,
+                                    stream=True, timeout=TIMEOUT)
 
             if response.status_code == 416:
                 if temp_path.exists():
@@ -567,7 +640,8 @@ def download_file_simple(url: str, save_path: Path, mirrors: list[str],
 
 
 def download_file(url: str, save_path: Path, num_threads: int = NUM_THREADS) -> bool:
-    """智能下载：根据情况选择多线程或单线程"""
+    """智能下载入口"""
+    save_path.parent.mkdir(parents=True, exist_ok=True)
 
     # 检查是否有保存的进度
     existing_progress = load_progress(url, save_path)
@@ -575,8 +649,7 @@ def download_file(url: str, save_path: Path, num_threads: int = NUM_THREADS) -> 
         print(f"  [恢复] 发现之前的下载进度")
         mirrors = existing_progress.mirrors
     else:
-        # 测速选择最佳镜像
-        mirrors = select_best_mirrors(url, count=min(num_threads, len(MIRRORS)))
+        mirrors = select_best_mirrors(url, count=min(3, len(MIRRORS)))
 
     # 获取文件信息
     file_size, supports_range = get_file_info(url, mirrors)
@@ -593,43 +666,42 @@ def download_file(url: str, save_path: Path, num_threads: int = NUM_THREADS) -> 
         delete_progress(url, save_path)
         return True
 
-    # 大于 100MB 且支持分片，使用多线程
-    if file_size > 100 * 1024 * 1024 and supports_range and len(mirrors) > 1:
-        return download_file_multithread(url, save_path, mirrors, file_size, num_threads, existing_progress)
+    # 大于 50MB 且支持分片，使用 FlashGet 模式
+    if file_size > 50 * 1024 * 1024 and supports_range:
+        downloader = BlockDownloader(
+            url, save_path, file_size, mirrors, num_threads, existing_progress
+        )
+        return downloader.download()
     else:
-        return download_file_simple(url, save_path, mirrors, existing_progress)
+        return download_file_simple(url, save_path, mirrors)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='ComfyUI 模型下载工具 - 多镜像加速版（支持断点续传）',
+        description='ComfyUI 模型下载工具 - FlashGet 多线程模式',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 示例:
-  %(prog)s https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/text_encoders/qwen_3_4b.safetensors
-  %(prog)s https://huggingface.co/xxx/model.safetensors Z:/models/checkpoints/model.safetensors
-  %(prog)s -t 8 https://huggingface.co/xxx/model.safetensors
-
-断点续传:
-  %(prog)s -r              # 续传最近一次未完成的下载
+  %(prog)s https://huggingface.co/xxx/model.safetensors
+  %(prog)s -t 16 https://huggingface.co/xxx/model.safetensors
+  %(prog)s -r              # 续传上次未完成的下载
   %(prog)s -r --list       # 列出所有未完成的下载
-  进度信息保存在 ~/.comfy_download/ 目录。
         '''
     )
     parser.add_argument('url', nargs='?', help='HuggingFace 模型下载 URL')
-    parser.add_argument('save_path', nargs='?', help='保存路径（可选，默认根据 URL 自动推断）')
+    parser.add_argument('save_path', nargs='?', help='保存路径（可选）')
     parser.add_argument('-r', '--resume', action='store_true',
                         help='续传上次未完成的下载')
     parser.add_argument('--list', action='store_true',
-                        help='列出所有未完成的下载（配合 -r 使用）')
-    parser.add_argument('-t', '--threads', type=int, default=4,
-                        help='并行下载线程数（默认 4）')
+                        help='列出所有未完成的下载')
+    parser.add_argument('-t', '--threads', type=int, default=NUM_THREADS,
+                        help=f'并行下载线程数（默认 {NUM_THREADS}）')
     parser.add_argument('-o', '--output-dir', type=str, default="Z:/models",
                         help='模型保存根目录（默认 Z:/models）')
 
     args = parser.parse_args()
 
-    # 处理 -r 参数：续传模式
+    # 处理 -r 参数
     if args.resume or args.list:
         pending = list_pending_downloads()
 
@@ -638,7 +710,6 @@ def main():
             sys.exit(0)
 
         if args.list:
-            # 列出所有未完成的下载
             print("=" * 60)
             print("未完成的下载任务:")
             print("=" * 60)
@@ -646,46 +717,41 @@ def main():
                 percent = p.downloaded_size * 100 / p.file_size if p.file_size > 0 else 0
                 time_str = time.strftime('%Y-%m-%d %H:%M', time.localtime(p.timestamp))
                 print(f"\n[{i}] {Path(p.save_path).name}")
-                print(f"    进度: {p.downloaded_size / 1024 / 1024:.1f} MB / {p.file_size / 1024 / 1024:.1f} MB ({percent:.1f}%)")
+                print(f"    进度: {p.downloaded_size / 1024 / 1024:.1f} MB / "
+                      f"{p.file_size / 1024 / 1024:.1f} MB ({percent:.1f}%)")
                 print(f"    路径: {p.save_path}")
                 print(f"    时间: {time_str}")
             print("\n" + "=" * 60)
-            print("使用 -r 续传最近的任务，或运行原始命令续传指定任务")
             sys.exit(0)
 
-        # 续传最近的一个任务
         latest = pending[0]
         args.url = latest.url
         args.save_path = latest.save_path
         percent = latest.downloaded_size * 100 / latest.file_size if latest.file_size > 0 else 0
         print(f"续传任务: {Path(latest.save_path).name}")
-        print(f"进度: {latest.downloaded_size / 1024 / 1024:.1f} MB / {latest.file_size / 1024 / 1024:.1f} MB ({percent:.1f}%)")
+        print(f"进度: {latest.downloaded_size / 1024 / 1024:.1f} MB / "
+              f"{latest.file_size / 1024 / 1024:.1f} MB ({percent:.1f}%)")
 
-    # 检查是否提供了 URL
     if not args.url:
         parser.print_help()
         sys.exit(1)
 
-    # 更新配置
     num_threads = args.threads
     models_dir = Path(args.output_dir)
 
-    # 确定保存路径
     if args.save_path:
         save_path = Path(args.save_path)
     else:
         save_path = get_save_path_from_url(args.url, models_dir)
 
     print("=" * 60)
-    print("ComfyUI 模型下载工具 (多镜像加速版 + 断点续传)")
+    print("ComfyUI 模型下载工具 (FlashGet 多线程模式)")
     print("=" * 60)
     print(f"URL: {args.url}")
     print(f"保存: {save_path}")
-    print(f"镜像: {', '.join(MIRRORS)}")
     print(f"线程: {num_threads}")
     print("=" * 60)
 
-    # 执行下载
     if download_file(args.url, save_path, num_threads):
         print("\n下载成功!")
         sys.exit(0)
