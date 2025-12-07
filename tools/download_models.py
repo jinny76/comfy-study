@@ -12,6 +12,12 @@ ComfyUI 模型下载脚本 - FlashGet 多线程模式
     # 使用更多线程 (默认8线程)
     python download_models.py -t 16 <url>
 
+    # 指定期望的 SHA256 哈希值进行验证
+    python download_models.py --sha256 abc123... <url>
+
+    # 自动从 HuggingFace 获取哈希值验证
+    python download_models.py --verify <url>
+
     # 示例
     python download_models.py https://huggingface.co/xxx/model.safetensors
 
@@ -21,6 +27,7 @@ ComfyUI 模型下载脚本 - FlashGet 多线程模式
     3. 自动测速选择最快镜像
     4. 断点续传（进度保存到 ~/.comfy_download/）
     5. 慢速自动切换镜像
+    6. SHA256 哈希验证（支持自动获取或手动指定）
 """
 
 import os
@@ -293,6 +300,84 @@ def check_file_complete(save_path: Path, expected_size: int) -> bool:
     if not save_path.exists():
         return False
     return save_path.stat().st_size == expected_size
+
+
+def fetch_hf_sha256(url: str) -> Optional[str]:
+    """从 HuggingFace 获取文件的 SHA256 哈希值"""
+    # 将下载 URL 转换为 blob 页面 URL
+    # https://huggingface.co/xxx/resolve/main/file.safetensors
+    # -> https://huggingface.co/xxx/blob/main/file.safetensors
+    if '/resolve/' not in url:
+        return None
+
+    blob_url = url.replace('/resolve/', '/blob/')
+    # 确保使用原始 huggingface.co
+    for mirror in MIRRORS:
+        blob_url = blob_url.replace(mirror, 'huggingface.co')
+
+    try:
+        print(f"  [哈希] 从 HuggingFace 获取 SHA256...")
+        response = requests.get(blob_url, timeout=TIMEOUT[0])
+        if response.status_code == 200:
+            # 在页面中搜索 SHA256 哈希值 (64位十六进制)
+            import re
+            # HuggingFace 页面中的哈希格式
+            patterns = [
+                r'"oid":"([a-f0-9]{64})"',  # JSON 格式
+                r'sha256["\s:]+([a-f0-9]{64})',  # 通用格式
+                r'>([a-f0-9]{64})<',  # HTML 标签内
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, response.text, re.IGNORECASE)
+                if match:
+                    sha256 = match.group(1).lower()
+                    print(f"  [哈希] 获取到: {sha256[:16]}...")
+                    return sha256
+    except Exception as e:
+        print(f"  [哈希] 获取失败: {e}")
+
+    return None
+
+
+def calculate_file_sha256(filepath: Path, show_progress: bool = True) -> str:
+    """计算文件的 SHA256 哈希值"""
+    sha256 = hashlib.sha256()
+    file_size = filepath.stat().st_size
+
+    if show_progress:
+        with tqdm(total=file_size, unit='B', unit_scale=True,
+                  desc="SHA256 校验", ncols=80) as pbar:
+            with open(filepath, 'rb') as f:
+                while True:
+                    data = f.read(8 * 1024 * 1024)  # 8MB chunks
+                    if not data:
+                        break
+                    sha256.update(data)
+                    pbar.update(len(data))
+    else:
+        with open(filepath, 'rb') as f:
+            while True:
+                data = f.read(8 * 1024 * 1024)
+                if not data:
+                    break
+                sha256.update(data)
+
+    return sha256.hexdigest()
+
+
+def verify_file_hash(filepath: Path, expected_hash: str) -> bool:
+    """验证文件哈希值"""
+    print(f"  [验证] 计算文件哈希...")
+    actual_hash = calculate_file_sha256(filepath)
+
+    if actual_hash.lower() == expected_hash.lower():
+        print(f"  [验证] SHA256 校验通过!")
+        return True
+    else:
+        print(f"  [验证] SHA256 校验失败!")
+        print(f"    期望: {expected_hash}")
+        print(f"    实际: {actual_hash}")
+        return False
 
 
 class SlowSpeedError(Exception):
@@ -676,15 +761,34 @@ def download_file_simple(url: str, save_path: Path, mirrors: list[str]) -> bool:
     return False
 
 
-def download_file(url: str, save_path: Path, num_threads: int = NUM_THREADS) -> bool:
-    """智能下载入口"""
+def download_file(url: str, save_path: Path, num_threads: int = NUM_THREADS,
+                  expected_sha256: Optional[str] = None, auto_verify: bool = False,
+                  no_mirror: bool = False) -> bool:
+    """智能下载入口
+
+    Args:
+        url: 下载 URL
+        save_path: 保存路径
+        num_threads: 线程数
+        expected_sha256: 期望的 SHA256 哈希值（手动指定）
+        auto_verify: 是否自动从 HuggingFace 获取哈希值验证
+        no_mirror: 不使用镜像，只从原始源下载
+    """
     save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 获取期望的哈希值
+    sha256_to_verify = expected_sha256
+    if auto_verify and not sha256_to_verify:
+        sha256_to_verify = fetch_hf_sha256(url)
 
     # 检查是否有保存的进度
     existing_progress = load_progress(url, save_path)
     if existing_progress:
         print(f"  [恢复] 发现之前的下载进度")
         mirrors = existing_progress.mirrors
+    elif no_mirror:
+        print(f"  [直连] 只使用 huggingface.co 原始源")
+        mirrors = ["huggingface.co"]
     else:
         mirrors = select_best_mirrors(url, count=min(3, len(MIRRORS)))
 
@@ -699,7 +803,12 @@ def download_file(url: str, save_path: Path, num_threads: int = NUM_THREADS) -> 
 
     # 检查是否已存在
     if check_file_complete(save_path, file_size):
-        print(f"  [跳过] 文件已存在且完整")
+        print(f"  [跳过] 文件已存在且大小匹配")
+        # 即使文件存在，如果指定了哈希也要验证
+        if sha256_to_verify:
+            if not verify_file_hash(save_path, sha256_to_verify):
+                print(f"  [警告] 现有文件哈希不匹配，建议重新下载")
+                return False
         delete_progress(url, save_path)
         return True
 
@@ -708,9 +817,19 @@ def download_file(url: str, save_path: Path, num_threads: int = NUM_THREADS) -> 
         downloader = BlockDownloader(
             url, save_path, file_size, mirrors, num_threads, existing_progress
         )
-        return downloader.download()
+        success = downloader.download()
     else:
-        return download_file_simple(url, save_path, mirrors)
+        success = download_file_simple(url, save_path, mirrors)
+
+    # 下载完成后验证哈希
+    if success and sha256_to_verify:
+        if not verify_file_hash(save_path, sha256_to_verify):
+            print(f"  [错误] 下载的文件哈希不匹配，文件可能损坏")
+            # 可选：删除损坏的文件
+            # save_path.unlink()
+            return False
+
+    return success
 
 
 def main():
@@ -735,6 +854,12 @@ def main():
                         help=f'并行下载线程数（默认 {NUM_THREADS}）')
     parser.add_argument('-o', '--output-dir', type=str, default="Z:/models",
                         help='模型保存根目录（默认 Z:/models）')
+    parser.add_argument('--sha256', type=str, default=None,
+                        help='期望的 SHA256 哈希值（用于验证）')
+    parser.add_argument('--verify', action='store_true',
+                        help='自动从 HuggingFace 获取并验证 SHA256')
+    parser.add_argument('--no-mirror', action='store_true',
+                        help='不使用镜像，只从 huggingface.co 原始源下载')
 
     args = parser.parse_args()
 
@@ -789,7 +914,9 @@ def main():
     print(f"线程: {num_threads}")
     print("=" * 60)
 
-    if download_file(args.url, save_path, num_threads):
+    if download_file(args.url, save_path, num_threads,
+                     expected_sha256=args.sha256, auto_verify=args.verify,
+                     no_mirror=args.no_mirror):
         print("\n下载成功!")
         sys.exit(0)
     else:
