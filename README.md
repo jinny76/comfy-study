@@ -44,6 +44,7 @@
 | 15 | [前端架构](study/15-前端架构-frontend.md) | `web/` | Vue 3 + LiteGraph.js、服务层、状态管理 |
 | 16 | [文本编码器](study/16-文本编码器-clip.md) | `clip_model.py` | CLIP、T5、Tokenizer、权重语法、Embedding |
 | 17 | [模型检测](study/17-模型检测-model_detection.md) | `model_detection.py` | 自动识别 60+ 种模型、UNet 配置推断 |
+| 18 | [缓存系统](study/18-缓存系统-caching.md) | `caching.py` | 执行缓存、LRU、RAM 压力、EasyCache 采样加速 |
 
 ## 用户指南
 
