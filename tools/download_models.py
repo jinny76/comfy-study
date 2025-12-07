@@ -66,10 +66,12 @@ MIRRORS = [
 ]
 
 # 下载配置
-TIMEOUT = (10, 60)  # (连接超时, 读取超时)
+TIMEOUT = (10, 30)  # (连接超时, 读取超时) - 缩短读取超时
 CHUNK_SIZE = 1024 * 1024  # 1MB
 NUM_THREADS = 4  # 每个文件的并行下载线程数
-MAX_RETRIES = 5
+MAX_RETRIES = 10  # 增加重试次数，因为会更频繁地重连
+MIN_SPEED = 50 * 1024  # 最低速度 50KB/s，低于此值重连
+SPEED_CHECK_INTERVAL = 5  # 每5秒检查一次速度
 
 
 @dataclass
@@ -273,10 +275,15 @@ def check_file_complete(save_path: Path, expected_size: int) -> bool:
     return save_path.stat().st_size == expected_size
 
 
+class SlowSpeedError(Exception):
+    """速度过慢异常，用于触发重连"""
+    pass
+
+
 def download_chunk(url: str, start: int, end: int, mirrors: list[str],
                    chunk_index: int, temp_dir: Path, progress: DownloadProgress,
                    pbar: tqdm, lock: threading.Lock) -> bool:
-    """下载单个分片到临时文件"""
+    """下载单个分片到临时文件，带速度监测和自动重连"""
     global interrupted
     chunk_file = temp_dir / f"chunk_{chunk_index:04d}"
 
@@ -286,25 +293,24 @@ def download_chunk(url: str, start: int, end: int, mirrors: list[str],
 
     if chunk_downloaded >= chunk_size:
         # 分片已完成
-        with lock:
-            pbar.update(chunk_size - pbar.n if chunk_index == 0 else 0)
         return True
 
-    # 从断点继续
-    current_start = start + chunk_downloaded
-
-    headers = {
-        'User-Agent': 'Mozilla/5.0',
-        'Range': f'bytes={current_start}-{end}'
-    }
+    mirror_index = chunk_index % len(mirrors)  # 初始镜像，每个线程用不同的
 
     for retry in range(MAX_RETRIES):
         if interrupted:
             return False
 
-        # 轮流尝试不同镜像
-        mirror = mirrors[retry % len(mirrors)]
+        # 选择镜像：每次重试切换到下一个镜像
+        mirror = mirrors[(mirror_index + retry) % len(mirrors)]
         download_url = url.replace("huggingface.co", mirror)
+
+        # 更新 Range header
+        current_start = start + chunk_downloaded
+        headers = {
+            'User-Agent': 'Mozilla/5.0',
+            'Range': f'bytes={current_start}-{end}'
+        }
 
         try:
             response = requests.get(
@@ -318,8 +324,13 @@ def download_chunk(url: str, start: int, end: int, mirrors: list[str],
                 continue
 
             mode = 'ab' if chunk_downloaded > 0 else 'wb'
+
+            # 速度监测变量
+            speed_check_start = time.time()
+            speed_check_bytes = 0
+
             with open(chunk_file, mode) as f:
-                for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+                for data in response.iter_content(chunk_size=CHUNK_SIZE):
                     if interrupted:
                         # 保存当前进度
                         with lock:
@@ -328,24 +339,47 @@ def download_chunk(url: str, start: int, end: int, mirrors: list[str],
                             save_progress(progress)
                         return False
 
-                    if chunk:
-                        f.write(chunk)
-                        chunk_downloaded += len(chunk)
+                    if data:
+                        f.write(data)
+                        data_len = len(data)
+                        chunk_downloaded += data_len
+                        speed_check_bytes += data_len
+
                         with lock:
-                            pbar.update(len(chunk))
-                            # 更新进度
+                            pbar.update(data_len)
                             progress.chunk_states[str(chunk_index)] = chunk_downloaded
                             progress.downloaded_size = sum(progress.chunk_states.values())
 
-            # 定期保存进度
+                        # 每隔一段时间检查速度
+                        elapsed = time.time() - speed_check_start
+                        if elapsed >= SPEED_CHECK_INTERVAL:
+                            speed = speed_check_bytes / elapsed
+                            if speed < MIN_SPEED:
+                                # 速度太慢，抛异常触发重连
+                                raise SlowSpeedError(
+                                    f"速度过慢: {speed/1024:.1f} KB/s < {MIN_SPEED/1024:.0f} KB/s, 切换镜像"
+                                )
+                            # 重置计数器
+                            speed_check_start = time.time()
+                            speed_check_bytes = 0
+
+            # 下载完成，保存进度
             with lock:
                 save_progress(progress)
 
             return True
 
+        except SlowSpeedError as e:
+            # 速度过慢，切换镜像重试
+            with lock:
+                # 不用打印太多，进度条已经能看出来卡住了
+                pass
+            continue
+
         except Exception as e:
+            # 其他错误，短暂等待后重试
             if retry < MAX_RETRIES - 1:
-                time.sleep(1)
+                time.sleep(0.5)
             continue
 
     return False
@@ -401,7 +435,10 @@ def download_file_multithread(url: str, save_path: Path, mirrors: list[str],
 
     lock = threading.Lock()
 
-    print(f"  [下载] {num_threads} 线程并行下载...")
+    # 显示线程和镜像分配
+    print(f"  [下载] {num_threads} 线程并行下载 (速度 < {MIN_SPEED//1024}KB/s 自动切换镜像)")
+    for i in range(min(num_threads, len(mirrors))):
+        print(f"    线程 {i}: {mirrors[i % len(mirrors)]}")
 
     with tqdm(total=file_size, initial=initial_downloaded, unit='B', unit_scale=True,
               desc=save_path.name[:30], ncols=80) as pbar:
@@ -409,11 +446,9 @@ def download_file_multithread(url: str, save_path: Path, mirrors: list[str],
         with ThreadPoolExecutor(max_workers=num_threads) as executor:
             futures = []
             for chunk_index, start, end in chunks:
-                # 分配不同镜像给不同线程
-                thread_mirrors = mirrors[chunk_index % len(mirrors):] + mirrors[:chunk_index % len(mirrors)]
                 future = executor.submit(
                     download_chunk, url, start, end,
-                    thread_mirrors, chunk_index, temp_dir, progress, pbar, lock
+                    mirrors, chunk_index, temp_dir, progress, pbar, lock
                 )
                 futures.append(future)
 
