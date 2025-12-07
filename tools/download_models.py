@@ -59,8 +59,9 @@ if hasattr(signal, 'SIGTERM'):
 # 默认保存目录
 MODELS_DIR = Path("Z:/models")
 
-# 进度文件目录
+# 进度文件目录 (也用于临时下载)
 PROGRESS_DIR = Path("~/.comfy_download").expanduser()
+TEMP_DOWNLOAD_DIR = PROGRESS_DIR / "downloading"  # 本地临时下载目录
 
 # 多镜像源
 MIRRORS = [
@@ -311,8 +312,11 @@ class BlockDownloader:
         self.mirrors = mirrors
         self.num_threads = num_threads
 
-        # 创建临时目录
-        self.temp_dir = save_path.parent / f".{save_path.name}.parts"
+        # 使用本地临时目录下载 (SSD 快)，完成后再复制到目标
+        TEMP_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        # 用文件名的 hash 创建唯一目录，避免冲突
+        file_hash = hashlib.md5(f"{url}:{save_path}".encode()).hexdigest()[:12]
+        self.temp_dir = TEMP_DOWNLOAD_DIR / f"{save_path.stem}_{file_hash}"
         self.temp_dir.mkdir(parents=True, exist_ok=True)
 
         # 初始化块列表
@@ -499,6 +503,7 @@ class BlockDownloader:
         pending = sum(1 for b in self.blocks if not b.is_complete)
 
         print(f"  [下载] FlashGet 模式: {self.num_threads} 线程, {num_blocks} 块 (每块 {BLOCK_SIZE // 1024 // 1024}MB)")
+        print(f"  [下载] 临时目录: {self.temp_dir}")
         print(f"  [下载] 速度 < {MIN_SPEED // 1024}KB/s 自动切换镜像")
 
         with tqdm(total=self.file_size, initial=self.downloaded_bytes,
@@ -537,25 +542,54 @@ class BlockDownloader:
         return self._merge_blocks()
 
     def _merge_blocks(self) -> bool:
-        """合并所有块到最终文件"""
-        print("  [合并] 合并分块文件...")
+        """合并所有块到本地临时文件，然后复制到目标目录"""
+        import shutil
+
+        # 本地临时合并文件
+        local_merged = self.temp_dir / self.save_path.name
+        print(f"  [合并] 合并分块到本地临时文件...")
 
         try:
-            with open(self.save_path, 'wb') as outfile:
+            # 第一步：合并到本地
+            with open(local_merged, 'wb') as outfile:
                 for block in sorted(self.blocks, key=lambda b: b.index):
                     block_file = self.temp_dir / f"block_{block.index:06d}"
                     with open(block_file, 'rb') as infile:
                         outfile.write(infile.read())
                     block_file.unlink()
 
-            # 验证文件大小
+            # 验证本地文件大小
+            local_size = local_merged.stat().st_size
+            if local_size != self.file_size:
+                print(f"  [错误] 文件大小不匹配: {local_size} != {self.file_size}")
+                local_merged.unlink()
+                return False
+
+            # 第二步：复制到目标目录
+            self.save_path.parent.mkdir(parents=True, exist_ok=True)
+            print(f"  [复制] 复制到目标: {self.save_path}")
+
+            # 使用 shutil.copy2 保留元数据，带进度显示
+            with tqdm(total=self.file_size, unit='B', unit_scale=True,
+                      desc="复制中", ncols=80) as pbar:
+                with open(local_merged, 'rb') as src:
+                    with open(self.save_path, 'wb') as dst:
+                        while True:
+                            buf = src.read(1024 * 1024)  # 1MB chunks
+                            if not buf:
+                                break
+                            dst.write(buf)
+                            pbar.update(len(buf))
+
+            # 验证目标文件大小
             final_size = self.save_path.stat().st_size
             if final_size != self.file_size:
-                print(f"  [错误] 文件大小不匹配: {final_size} != {self.file_size}")
+                print(f"  [错误] 目标文件大小不匹配: {final_size} != {self.file_size}")
                 self.save_path.unlink()
                 return False
 
-            # 清理
+            # 清理本地临时文件
+            local_merged.unlink()
             try:
                 self.temp_dir.rmdir()
             except:
@@ -567,7 +601,10 @@ class BlockDownloader:
             return True
 
         except Exception as e:
-            print(f"  [错误] 合并失败: {e}")
+            print(f"  [错误] 合并/复制失败: {e}")
+            # 保留本地已合并文件以便恢复
+            if local_merged.exists():
+                print(f"  [提示] 本地已合并文件保留在: {local_merged}")
             return False
 
     def _print_stats(self):
