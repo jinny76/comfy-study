@@ -29,6 +29,7 @@ This repository contains my study notes while learning the ComfyUI codebase. Eac
 | 11 | [Latent Formats](study/11-Latent格式-latent_formats.py.md) | `latent_formats.py` | Latent space specs, scale factors, RGB preview |
 | 12 | [Conditioning](study/12-条件系统-conds.py.md) | `conds.py` | Condition wrappers, batching, area masks |
 | 13 | [Operations](study/13-操作封装-ops.py.md) | `ops.py` | Weight casting, FP8 ops, LoRA injection |
+| 14 | [Plugin System](study/14-插件系统-custom_nodes.md) | `nodes.py` | Custom nodes loading, V1/V3 API, extension mechanism |
 
 ## User Guides
 
