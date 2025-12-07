@@ -41,6 +41,7 @@
 | 12 | [条件系统](study/12-条件系统-conds.py.md) | `conds.py` | 条件封装、批处理、区域蒙版 |
 | 13 | [操作封装](study/13-操作封装-ops.py.md) | `ops.py` | 权重转换、FP8 算子、LoRA 注入点 |
 | 14 | [插件系统](study/14-插件系统-custom_nodes.md) | `nodes.py` | 自定义节点加载、V1/V3 API |
+| 15 | [前端架构](study/15-前端架构-frontend.md) | `web/` | Vue 3 + LiteGraph.js、服务层、状态管理 |
 
 ## 用户指南
 
