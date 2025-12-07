@@ -26,7 +26,12 @@ This repository contains my study notes while learning the ComfyUI codebase. Eac
 
 ## Tools
 
-- [`download_models.py`](download_models.py) - Multi-mirror accelerated model downloader with resume support
+- [`tools/download_models.py`](tools/download_models.py) - Multi-mirror accelerated model downloader
+  - Multi-mirror parallel download (hf-mirror.com, aifasthub.com)
+  - **Robust resume support** - progress saved to `~/.comfy_download/`
+  - Ctrl+C safe - gracefully saves progress on interrupt
+  - File size verification across mirrors
+  - Auto speed test to select fastest mirror
 
 ## Architecture Overview
 

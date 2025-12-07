@@ -13,30 +13,53 @@ ComfyUI 模型下载脚本 - 多镜像加速版
 功能:
     1. 多镜像并行分片下载（加速）
     2. 自动测速选择最快镜像
-    3. 支持断点续传
+    3. 支持断点续传（进度保存到 .progress 文件）
     4. 检查文件大小，已存在且大小正确则跳过
 """
 
-import re
 import os
 import sys
+import json
+import signal
 import argparse
 import requests
 import threading
 import time
+import hashlib
 from pathlib import Path
 from urllib.parse import urlparse, unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
+from dataclasses import dataclass, asdict
+from typing import Optional
+
+# 全局中断标志
+interrupted = False
+
+def signal_handler(signum, frame):
+    """处理 Ctrl+C 信号"""
+    global interrupted
+    interrupted = True
+    print("\n\n  [中断] 收到中断信号，正在保存进度...")
+
+
+# 注册信号处理器
+signal.signal(signal.SIGINT, signal_handler)
+if hasattr(signal, 'SIGTERM'):
+    signal.signal(signal.SIGTERM, signal_handler)
 
 # 默认保存目录
 MODELS_DIR = Path("Z:/models")
 
+# 进度文件目录
+PROGRESS_DIR = Path("~/.comfy_download").expanduser()
+
 # 多镜像源（会自动测速选择最快的）
+# 参考: https://hf-mirror.com/, https://aifasthub.com/
 MIRRORS = [
-    "huggingface.co",      # 原始源
-    "hf-mirror.com",       # 国内镜像1
-    # "huggingface.bytedance.net",  # 字节镜像（如果可用）
+    "hf-mirror.com",       # 国内镜像（推荐）
+    "aifasthub.com",       # AI快站镜像
+    "huggingface.co",      # 原始源（需要梯子）
 ]
 
 # 下载配置
@@ -44,6 +67,64 @@ TIMEOUT = (10, 60)  # (连接超时, 读取超时)
 CHUNK_SIZE = 1024 * 1024  # 1MB
 NUM_THREADS = 4  # 每个文件的并行下载线程数
 MAX_RETRIES = 5
+
+
+@dataclass
+class DownloadProgress:
+    """下载进度信息"""
+    url: str
+    save_path: str
+    file_size: int
+    downloaded_size: int
+    chunk_states: dict  # {chunk_index: downloaded_bytes}
+    mirrors: list
+    timestamp: float
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), ensure_ascii=False, indent=2)
+
+    @classmethod
+    def from_json(cls, json_str: str) -> 'DownloadProgress':
+        data = json.loads(json_str)
+        return cls(**data)
+
+
+def get_progress_file(url: str, save_path: Path) -> Path:
+    """获取进度文件路径"""
+    PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
+    # 使用 URL 和保存路径的哈希作为文件名
+    key = f"{url}:{save_path}"
+    hash_name = hashlib.md5(key.encode()).hexdigest()[:16]
+    return PROGRESS_DIR / f"{hash_name}.progress"
+
+
+def load_progress(url: str, save_path: Path) -> Optional[DownloadProgress]:
+    """加载下载进度"""
+    progress_file = get_progress_file(url, save_path)
+    if progress_file.exists():
+        try:
+            content = progress_file.read_text(encoding='utf-8')
+            progress = DownloadProgress.from_json(content)
+            # 验证 URL 和保存路径匹配
+            if progress.url == url and progress.save_path == str(save_path):
+                return progress
+        except Exception as e:
+            print(f"  [警告] 无法加载进度文件: {e}")
+    return None
+
+
+def save_progress(progress: DownloadProgress):
+    """保存下载进度"""
+    progress_file = get_progress_file(progress.url, Path(progress.save_path))
+    progress.timestamp = time.time()
+    progress_file.write_text(progress.to_json(), encoding='utf-8')
+
+
+def delete_progress(url: str, save_path: Path):
+    """删除进度文件"""
+    progress_file = get_progress_file(url, save_path)
+    if progress_file.exists():
+        progress_file.unlink()
 
 
 def get_filename_from_url(url: str) -> str:
@@ -128,18 +209,39 @@ def select_best_mirrors(url: str, count: int = 2) -> list[str]:
 
 
 def get_file_info(url: str, mirrors: list[str]) -> tuple[int, bool]:
-    """获取文件大小和是否支持分片下载"""
+    """获取文件大小和是否支持分片下载，从多个镜像验证尺寸一致性"""
+    sizes = []
+    accept_ranges = False
+
     for mirror in mirrors:
         test_url = url.replace("huggingface.co", mirror)
         try:
             response = requests.head(test_url, timeout=TIMEOUT[0], allow_redirects=True)
             if response.status_code == 200:
                 size = int(response.headers.get('content-length', 0))
-                accept_ranges = response.headers.get('accept-ranges', '').lower() == 'bytes'
-                return (size, accept_ranges)
+                if size > 0:
+                    sizes.append((mirror, size))
+                    if response.headers.get('accept-ranges', '').lower() == 'bytes':
+                        accept_ranges = True
         except:
             continue
-    return (0, False)
+
+    if not sizes:
+        return (0, False)
+
+    # 验证所有镜像返回相同的文件大小
+    first_size = sizes[0][1]
+    for mirror, size in sizes[1:]:
+        if size != first_size:
+            print(f"  [警告] 镜像文件大小不一致: {sizes[0][0]}={first_size}, {mirror}={size}")
+            # 使用原始源的大小（如果有）
+            for m, s in sizes:
+                if 'huggingface.co' in m:
+                    return (s, accept_ranges)
+            # 否则使用第一个
+            return (first_size, accept_ranges)
+
+    return (first_size, accept_ranges)
 
 
 def check_file_complete(save_path: Path, expected_size: int) -> bool:
@@ -149,15 +251,35 @@ def check_file_complete(save_path: Path, expected_size: int) -> bool:
     return save_path.stat().st_size == expected_size
 
 
-def download_range(url: str, start: int, end: int, mirrors: list[str],
-                   result: bytearray, offset: int, pbar: tqdm, lock: threading.Lock) -> bool:
-    """下载指定范围的数据"""
+def download_chunk(url: str, start: int, end: int, mirrors: list[str],
+                   chunk_index: int, temp_dir: Path, progress: DownloadProgress,
+                   pbar: tqdm, lock: threading.Lock) -> bool:
+    """下载单个分片到临时文件"""
+    global interrupted
+    chunk_file = temp_dir / f"chunk_{chunk_index:04d}"
+
+    # 检查已下载的部分
+    chunk_downloaded = progress.chunk_states.get(str(chunk_index), 0)
+    chunk_size = end - start + 1
+
+    if chunk_downloaded >= chunk_size:
+        # 分片已完成
+        with lock:
+            pbar.update(chunk_size - pbar.n if chunk_index == 0 else 0)
+        return True
+
+    # 从断点继续
+    current_start = start + chunk_downloaded
+
     headers = {
         'User-Agent': 'Mozilla/5.0',
-        'Range': f'bytes={start}-{end}'
+        'Range': f'bytes={current_start}-{end}'
     }
 
     for retry in range(MAX_RETRIES):
+        if interrupted:
+            return False
+
         # 轮流尝试不同镜像
         mirror = mirrors[retry % len(mirrors)]
         download_url = url.replace("huggingface.co", mirror)
@@ -173,13 +295,29 @@ def download_range(url: str, start: int, end: int, mirrors: list[str],
             if response.status_code not in (200, 206):
                 continue
 
-            pos = 0
-            for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-                if chunk:
-                    result[offset + pos:offset + pos + len(chunk)] = chunk
-                    pos += len(chunk)
-                    with lock:
-                        pbar.update(len(chunk))
+            mode = 'ab' if chunk_downloaded > 0 else 'wb'
+            with open(chunk_file, mode) as f:
+                for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+                    if interrupted:
+                        # 保存当前进度
+                        with lock:
+                            progress.chunk_states[str(chunk_index)] = chunk_downloaded
+                            progress.downloaded_size = sum(progress.chunk_states.values())
+                            save_progress(progress)
+                        return False
+
+                    if chunk:
+                        f.write(chunk)
+                        chunk_downloaded += len(chunk)
+                        with lock:
+                            pbar.update(len(chunk))
+                            # 更新进度
+                            progress.chunk_states[str(chunk_index)] = chunk_downloaded
+                            progress.downloaded_size = sum(progress.chunk_states.values())
+
+            # 定期保存进度
+            with lock:
+                save_progress(progress)
 
             return True
 
@@ -192,54 +330,122 @@ def download_range(url: str, start: int, end: int, mirrors: list[str],
 
 
 def download_file_multithread(url: str, save_path: Path, mirrors: list[str],
-                               file_size: int, num_threads: int = NUM_THREADS) -> bool:
-    """多线程分片下载"""
+                               file_size: int, num_threads: int = NUM_THREADS,
+                               existing_progress: Optional[DownloadProgress] = None) -> bool:
+    """多线程分片下载，支持断点续传"""
+    global interrupted
+
     # 确保目录存在
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # 创建临时目录
+    temp_dir = save_path.parent / f".{save_path.name}.parts"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
     # 计算分片
     part_size = file_size // num_threads
-    ranges = []
+    chunks = []
     for i in range(num_threads):
         start = i * part_size
         end = file_size - 1 if i == num_threads - 1 else (i + 1) * part_size - 1
-        ranges.append((start, end))
+        chunks.append((i, start, end))
 
-    # 预分配内存
-    result = bytearray(file_size)
+    # 初始化或恢复进度
+    if existing_progress and existing_progress.file_size == file_size:
+        progress = existing_progress
+        # 从临时文件实际大小重新计算已下载量（更可靠）
+        actual_downloaded = 0
+        for i in range(num_threads):
+            chunk_file = temp_dir / f"chunk_{i:04d}"
+            if chunk_file.exists():
+                chunk_size = chunk_file.stat().st_size
+                progress.chunk_states[str(i)] = chunk_size
+                actual_downloaded += chunk_size
+        progress.downloaded_size = actual_downloaded
+        initial_downloaded = actual_downloaded
+        if initial_downloaded > 0:
+            print(f"  [续传] 已下载 {initial_downloaded / 1024 / 1024:.1f} MB / {file_size / 1024 / 1024:.1f} MB ({initial_downloaded * 100 / file_size:.1f}%)")
+    else:
+        progress = DownloadProgress(
+            url=url,
+            save_path=str(save_path),
+            file_size=file_size,
+            downloaded_size=0,
+            chunk_states={},
+            mirrors=mirrors,
+            timestamp=time.time()
+        )
+        initial_downloaded = 0
+
     lock = threading.Lock()
 
     print(f"  [下载] {num_threads} 线程并行下载...")
 
-    with tqdm(total=file_size, unit='B', unit_scale=True,
+    with tqdm(total=file_size, initial=initial_downloaded, unit='B', unit_scale=True,
               desc=save_path.name[:30], ncols=80) as pbar:
 
         with ThreadPoolExecutor(max_workers=num_threads) as executor:
             futures = []
-            for i, (start, end) in enumerate(ranges):
+            for chunk_index, start, end in chunks:
                 # 分配不同镜像给不同线程
-                thread_mirrors = mirrors[i % len(mirrors):] + mirrors[:i % len(mirrors)]
+                thread_mirrors = mirrors[chunk_index % len(mirrors):] + mirrors[:chunk_index % len(mirrors)]
                 future = executor.submit(
-                    download_range, url, start, end,
-                    thread_mirrors, result, start, pbar, lock
+                    download_chunk, url, start, end,
+                    thread_mirrors, chunk_index, temp_dir, progress, pbar, lock
                 )
                 futures.append(future)
 
             # 等待所有完成
-            success = all(f.result() for f in futures)
+            results = [f.result() for f in futures]
+            success = all(results)
 
-    if success:
-        # 写入文件
-        with open(save_path, 'wb') as f:
-            f.write(result)
-        print(f"  [完成] {save_path.name}")
-        return True
+    if success and not interrupted:
+        # 验证所有分片文件
+        all_chunks_exist = True
+        for i in range(num_threads):
+            chunk_file = temp_dir / f"chunk_{i:04d}"
+            if not chunk_file.exists():
+                all_chunks_exist = False
+                print(f"  [错误] 分片 {i} 不存在")
+                break
+
+        if all_chunks_exist:
+            # 合并分片
+            print("  [合并] 合并分片文件...")
+            with open(save_path, 'wb') as outfile:
+                for i in range(num_threads):
+                    chunk_file = temp_dir / f"chunk_{i:04d}"
+                    with open(chunk_file, 'rb') as infile:
+                        outfile.write(infile.read())
+                    chunk_file.unlink()
+
+            # 验证最终文件大小
+            final_size = save_path.stat().st_size
+            if final_size == file_size:
+                # 清理
+                try:
+                    temp_dir.rmdir()
+                except:
+                    pass
+                delete_progress(url, save_path)
+                print(f"  [完成] {save_path.name}")
+                return True
+            else:
+                print(f"  [错误] 文件大小不匹配: {final_size} != {file_size}")
+                save_path.unlink()
+                return False
+        else:
+            save_progress(progress)
+            return False
     else:
-        print(f"  [失败] 部分分片下载失败")
+        # 保存进度以便下次续传
+        save_progress(progress)
+        print(f"  [中断] 进度已保存到 ~/.comfy_download/，下次运行将自动续传")
         return False
 
 
-def download_file_simple(url: str, save_path: Path, mirrors: list[str]) -> bool:
+def download_file_simple(url: str, save_path: Path, mirrors: list[str],
+                          existing_progress: Optional[DownloadProgress] = None) -> bool:
     """简单单线程下载（用于小文件或不支持分片的情况）"""
     save_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = save_path.with_suffix(save_path.suffix + '.downloading')
@@ -289,6 +495,7 @@ def download_file_simple(url: str, save_path: Path, mirrors: list[str]) -> bool:
                             pbar.update(len(chunk))
 
             temp_path.rename(save_path)
+            delete_progress(url, save_path)
             print(f"  [完成] {save_path.name}")
             return True
 
@@ -305,8 +512,14 @@ def download_file_simple(url: str, save_path: Path, mirrors: list[str]) -> bool:
 def download_file(url: str, save_path: Path, num_threads: int = NUM_THREADS) -> bool:
     """智能下载：根据情况选择多线程或单线程"""
 
-    # 测速选择最佳镜像
-    mirrors = select_best_mirrors(url, count=min(num_threads, len(MIRRORS)))
+    # 检查是否有保存的进度
+    existing_progress = load_progress(url, save_path)
+    if existing_progress:
+        print(f"  [恢复] 发现之前的下载进度")
+        mirrors = existing_progress.mirrors
+    else:
+        # 测速选择最佳镜像
+        mirrors = select_best_mirrors(url, count=min(num_threads, len(MIRRORS)))
 
     # 获取文件信息
     file_size, supports_range = get_file_info(url, mirrors)
@@ -320,24 +533,29 @@ def download_file(url: str, save_path: Path, num_threads: int = NUM_THREADS) -> 
     # 检查是否已存在
     if check_file_complete(save_path, file_size):
         print(f"  [跳过] 文件已存在且完整")
+        delete_progress(url, save_path)
         return True
 
     # 大于 100MB 且支持分片，使用多线程
     if file_size > 100 * 1024 * 1024 and supports_range and len(mirrors) > 1:
-        return download_file_multithread(url, save_path, mirrors, file_size, num_threads)
+        return download_file_multithread(url, save_path, mirrors, file_size, num_threads, existing_progress)
     else:
-        return download_file_simple(url, save_path, mirrors)
+        return download_file_simple(url, save_path, mirrors, existing_progress)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='ComfyUI 模型下载工具 - 多镜像加速版',
+        description='ComfyUI 模型下载工具 - 多镜像加速版（支持断点续传）',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 示例:
   %(prog)s https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/text_encoders/qwen_3_4b.safetensors
   %(prog)s https://huggingface.co/xxx/model.safetensors Z:/models/checkpoints/model.safetensors
   %(prog)s -t 8 https://huggingface.co/xxx/model.safetensors
+
+断点续传:
+  下载中断后，再次运行相同命令会自动从断点继续下载。
+  进度信息保存在 ~/.comfy_download/ 目录。
         '''
     )
     parser.add_argument('url', help='HuggingFace 模型下载 URL')
@@ -360,7 +578,7 @@ def main():
         save_path = get_save_path_from_url(args.url, models_dir)
 
     print("=" * 60)
-    print("ComfyUI 模型下载工具 (多镜像加速版)")
+    print("ComfyUI 模型下载工具 (多镜像加速版 + 断点续传)")
     print("=" * 60)
     print(f"URL: {args.url}")
     print(f"保存: {save_path}")
@@ -373,7 +591,7 @@ def main():
         print("\n下载成功!")
         sys.exit(0)
     else:
-        print("\n下载失败!")
+        print("\n下载失败或中断!")
         sys.exit(1)
 
 
