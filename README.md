@@ -27,6 +27,7 @@ This repository contains my study notes while learning the ComfyUI codebase. Eac
 | 09 | [ControlNet](study/09-ControlNet-controlnet.py.md) | `controlnet.py` | ControlNet, T2I-Adapter, control signals |
 | 10 | [Hook System](study/10-Hook系统-hooks.py.md) | `hooks.py` | Dynamic weight switching, keyframe scheduling |
 | 11 | [Latent Formats](study/11-Latent格式-latent_formats.py.md) | `latent_formats.py` | Latent space specs, scale factors, RGB preview |
+| 12 | [Conditioning](study/12-条件系统-conds.py.md) | `conds.py` | Condition wrappers, batching, area masks |
 
 ## Tools
 
