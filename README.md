@@ -25,6 +25,7 @@ This repository contains my study notes while learning the ComfyUI codebase. Eac
 | 07 | [Model Loading](study/07-模型加载-sd.py.md) | `sd.py` | Checkpoint loading, CLIP, VAE, model detection |
 | 08 | [Model Patcher](study/08-模型修补-model_patcher.py.md) | `model_patcher.py` | LoRA, hooks, dynamic weight patching |
 | 09 | [ControlNet](study/09-ControlNet-controlnet.py.md) | `controlnet.py` | ControlNet, T2I-Adapter, control signals |
+| 10 | [Hook System](study/10-Hook系统-hooks.py.md) | `hooks.py` | Dynamic weight switching, keyframe scheduling |
 
 ## Tools
 
